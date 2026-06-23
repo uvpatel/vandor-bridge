@@ -70,6 +70,7 @@ export function SignupForm({
   }
 
   function handleSocial(provider: "github" | "google") {
+    document.cookie = `pending_role=${role}; path=/; max-age=600; SameSite=Lax`;
     startTransition(async () => {
       await signIn.social({
         provider,

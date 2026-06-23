@@ -15,8 +15,16 @@ import {
   FieldSeparator,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { signIn } from "@/lib/auth-client";
+
+const roles = [
+  { label: "Procurement Officer", value: "procurement_officer" },
+  { label: "Vendor", value: "vendor" },
+  { label: "Manager / Approver", value: "manager" },
+  { label: "Admin", value: "admin" },
+];
 
 export function LoginForm({
   className,
@@ -26,6 +34,7 @@ export function LoginForm({
   const searchParams = useSearchParams();
   const callbackURL = searchParams.get("callbackURL") ?? "/dashboard";
   const [error, setError] = React.useState("");
+  const [role, setRole] = React.useState("procurement_officer");
   const [isPending, startTransition] = React.useTransition();
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -54,6 +63,7 @@ export function LoginForm({
   }
 
   function handleSocial(provider: "github" | "google") {
+    document.cookie = `pending_role=${role}; path=/; max-age=600; SameSite=Lax`;
     startTransition(async () => {
       await signIn.social({
         provider,
@@ -101,6 +111,22 @@ export function LoginForm({
         </Field>
 
         <FieldSeparator>Or continue with</FieldSeparator>
+
+        <Field>
+          <FieldLabel>Role for Social Auth (New Users)</FieldLabel>
+          <Select value={role} onValueChange={setRole}>
+            <SelectTrigger className="bg-background">
+              <SelectValue placeholder="Select role" />
+            </SelectTrigger>
+            <SelectContent>
+              {roles.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
 
         <Field>
           <div className="grid grid-cols-2 gap-2">
