@@ -6,3 +6,8 @@ export default interface User {
     createdAt: Date;
     updatedAt: Date;
 }
+
+
+type PurchaseOrder = {
+  status: "draft" | "sent" | "paid" | "cancelled";
+};

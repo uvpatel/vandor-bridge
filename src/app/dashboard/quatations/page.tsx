@@ -15,10 +15,10 @@ import {
   Calendar, 
   Clock, 
   Star, 
-  TrendingUp, 
   Loader2, 
   FileCheck, 
-  ShieldAlert 
+  ShieldAlert,
+  ArrowRight
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -53,6 +53,63 @@ interface Quotation {
   submittedAt: string;
 }
 
+interface LineItem {
+  item: string;
+  qty: number;
+  unit: string;
+}
+
+interface QuoteLineInput {
+  item: string;
+  qty: number;
+  unitPrice: number;
+  deliveryDays: number;
+}
+
+function getRfqLineItems(rfq: RFQ): LineItem[] {
+  try {
+    const parsed = JSON.parse(rfq.description);
+    if (parsed && Array.isArray(parsed.lineItems)) {
+      return parsed.lineItems;
+    }
+  } catch (e) {}
+  return [{ item: rfq.title, qty: rfq.quantity, unit: rfq.unit }];
+}
+
+function parseQuotationDetails(quote: Quotation, rfq: RFQ | undefined) {
+  try {
+    const parsed = JSON.parse(quote.notes || "");
+    if (parsed && Array.isArray(parsed.lineItems)) {
+      const lineItems = parsed.lineItems as { item: string; qty: number; unitPrice: number; deliveryDays: number }[];
+      const subtotal = lineItems.reduce((sum, item) => sum + item.qty * item.unitPrice, 0);
+      const gst = subtotal * 0.18;
+      const grandTotal = subtotal + gst;
+      const maxDelivery = Math.max(...lineItems.map(item => item.deliveryDays), quote.deliveryDays);
+      return {
+        lineItems,
+        subtotal,
+        gst,
+        grandTotal,
+        deliveryDays: maxDelivery,
+        paymentTerms: parsed.paymentTerms || "Standard terms",
+      };
+    }
+  } catch (e) {}
+  
+  const qty = rfq?.quantity || 1;
+  const subtotal = qty * parseFloat(quote.unitPrice);
+  const gst = subtotal * parseFloat(quote.taxRate || "18.00") / 100;
+  const grandTotal = subtotal + gst;
+  return {
+    lineItems: [{ item: rfq?.title || "Item", qty, unitPrice: parseFloat(quote.unitPrice), deliveryDays: quote.deliveryDays }],
+    subtotal,
+    gst,
+    grandTotal,
+    deliveryDays: quote.deliveryDays,
+    paymentTerms: quote.notes || "Standard 30 days",
+  };
+}
+
 export default function QuotationsPage() {
   const { data: session } = useSession();
   const user = session?.user;
@@ -66,9 +123,11 @@ export default function QuotationsPage() {
   // Vendor state
   const [currentVendor, setCurrentVendor] = React.useState<Vendor | null>(null);
   const [vendorRfqId, setVendorRfqId] = React.useState("");
-  const [unitPrice, setUnitPrice] = React.useState("");
-  const [deliveryDays, setDeliveryDays] = React.useState("");
-  const [notes, setNotes] = React.useState("");
+  
+  // Multi-item quotation inputs (Screen 6)
+  const [quoteLineInputs, setQuoteLineInputs] = React.useState<QuoteLineInput[]>([]);
+  const [taxRate, setTaxRate] = React.useState(18);
+  const [paymentTerms, setPaymentTerms] = React.useState("Payment terms: 20 days net...");
   const [submitting, setSubmitting] = React.useState(false);
 
   // Officer state
@@ -115,17 +174,59 @@ export default function QuotationsPage() {
     fetchData();
   }, [fetchData]);
 
+  // When selected RFQ in vendor form changes, prepopulate line item pricing inputs
+  React.useEffect(() => {
+    if (!vendorRfqId) {
+      setQuoteLineInputs([]);
+      return;
+    }
+    const rfq = rfqsList.find(r => r.id === vendorRfqId);
+    if (rfq) {
+      const items = getRfqLineItems(rfq);
+      setQuoteLineInputs(items.map(item => ({
+        item: item.item,
+        qty: item.qty,
+        unitPrice: 0,
+        deliveryDays: 7,
+      })));
+    }
+  }, [vendorRfqId, rfqsList]);
+
+  const handleLinePriceChange = (index: number, field: "unitPrice" | "deliveryDays", value: any) => {
+    const updated = [...quoteLineInputs];
+    if (field === "unitPrice") {
+      updated[index][field] = parseFloat(value) || 0;
+    } else {
+      updated[index][field] = parseInt(value) || 0;
+    }
+    setQuoteLineInputs(updated);
+  };
+
+  // Calculations for Screen 6 Submission
+  const calculatedSubtotal = quoteLineInputs.reduce((sum, item) => sum + item.qty * item.unitPrice, 0);
+  const calculatedGst = calculatedSubtotal * (taxRate / 100);
+  const calculatedGrandTotal = calculatedSubtotal + calculatedGst;
+
   // Vendor quotation submission handler
-  const handleQuotationSubmit = async (e: React.FormEvent) => {
+  const handleQuotationSubmit = async (e: React.FormEvent, status: "draft" | "submitted" = "submitted") => {
     e.preventDefault();
     if (!currentVendor) {
       toast.error("Your email is not linked to a registered vendor profile");
       return;
     }
-    if (!vendorRfqId || !unitPrice || !deliveryDays) {
+    if (!vendorRfqId || quoteLineInputs.length === 0) {
       toast.error("Please fill all required fields");
       return;
     }
+
+    // Packing line item bids + terms inside notes JSON
+    const packedNotes = JSON.stringify({
+      lineItems: quoteLineInputs,
+      paymentTerms,
+    });
+
+    const averageUnitPrice = calculatedSubtotal / (quoteLineInputs.reduce((sum, item) => sum + item.qty, 0) || 1);
+    const maxDeliveryDays = Math.max(...quoteLineInputs.map(item => item.deliveryDays), 1);
 
     try {
       setSubmitting(true);
@@ -135,19 +236,18 @@ export default function QuotationsPage() {
         body: JSON.stringify({
           rfqId: vendorRfqId,
           vendorId: currentVendor.id,
-          unitPrice: parseFloat(unitPrice),
-          deliveryDays: parseInt(deliveryDays),
-          notes,
+          unitPrice: averageUnitPrice,
+          deliveryDays: maxDeliveryDays,
+          notes: packedNotes,
+          status,
         }),
       });
 
       const data = await res.json();
       if (res.ok) {
-        toast.success("Quotation submitted successfully!");
-        setUnitPrice("");
-        setDeliveryDays("");
-        setNotes("");
+        toast.success(status === "draft" ? "Draft saved successfully!" : "Quotation submitted successfully!");
         setVendorRfqId("");
+        setQuoteLineInputs([]);
         fetchData();
       } else {
         toast.error(data.error || "Failed to submit quotation");
@@ -170,15 +270,13 @@ export default function QuotationsPage() {
         body: JSON.stringify({
           quotationId,
           status: "pending",
-          remarks: "RFQ Shortlisted quotation submitted to Manager for final approval.",
+          remarks: "Quotation selected. RFQ Shortlisted and routed to Manager for final approval.",
         }),
       });
 
       const data = await res.json();
       if (res.ok) {
-        toast.success("Quotation shortlisted and submitted for Manager approval!");
-        
-        // Optimistically update status
+        toast.success("Quotation selected! Routed to approvals workflow.");
         setQuotationsList(prev => prev.map(q => q.id === quotationId ? { ...q, status: "shortlisted" } : q));
         fetchData();
       } else {
@@ -201,17 +299,15 @@ export default function QuotationsPage() {
     );
   }
 
-  // --- VENDOR WORKSPACE ---
+  // --- VENDOR WORKSPACE (Screen 6 Submission) ---
   if (isVendor) {
     const myQuotations = quotationsList.filter(q => currentVendor && q.vendorId === currentVendor.id);
-    
-    // Vendor is invited to any RFQ that lists them, or any active RFQ in the system for testing
-    const eligibleRfqs = rfqsList.filter(r => !["converted", "approved", "closed"].includes(r.status));
+    const eligibleRfqs = rfqsList.filter(r => !["draft", "converted", "approved", "closed"].includes(r.status));
 
     return (
       <div className="p-6 space-y-6">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900">Quotation Submission</h1>
+          <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Quotation Submission</h1>
           <p className="text-slate-500 text-sm">Respond to active RFQs by inputting competitive pricing and delivery logistics.</p>
         </div>
 
@@ -220,105 +316,219 @@ export default function QuotationsPage() {
             <CardHeader>
               <CardTitle className="text-amber-800 flex items-center gap-2"><ShieldAlert /> Supplier Profile Link Required</CardTitle>
               <CardDescription className="text-amber-700">
-                You are registered as a Vendor, but your user email (<span className="font-semibold">{user?.email}</span>) is not linked to any company record in our database.
+                Your email (<span className="font-semibold">{user?.email}</span>) is not linked to any registered vendor company in our database.
               </CardDescription>
             </CardHeader>
             <CardContent className="text-sm text-amber-700">
-              Please ask a Procurement Officer to register your vendor profile with your email address, or register it yourself under the Vendor screen.
+              Please register your company under the Vendors screen.
             </CardContent>
           </Card>
         ) : (
-          <div className="grid gap-6 md:grid-cols-3">
-            
-            {/* Submit Form */}
-            <Card className="border-primary/10 shadow-sm md:col-span-1">
-              <CardHeader>
-                <CardTitle>Submit Bid Pricing</CardTitle>
-                <CardDescription>Select an RFQ and input your quotation specifications.</CardDescription>
+          <div className="space-y-6">
+            <Card className="border-indigo-100 shadow-md">
+              <CardHeader className="border-b border-slate-100">
+                <CardTitle>Submit Quotations</CardTitle>
+                {vendorRfqId ? (
+                  <CardDescription className="text-indigo-600 font-medium">
+                    RFQ: {rfqsList.find(r => r.id === vendorRfqId)?.title}
+                  </CardDescription>
+                ) : (
+                  <CardDescription>Select an active RFQ to see lines and provide quotation details.</CardDescription>
+                )}
               </CardHeader>
-              <CardContent>
-                <form onSubmit={handleQuotationSubmit} className="space-y-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="rfqSelect">Select RFQ *</Label>
+              <CardContent className="pt-6">
+                <form onSubmit={(e) => handleQuotationSubmit(e)} className="space-y-6">
+                  {/* Select RFQ */}
+                  <div className="max-w-md space-y-2">
+                    <Label htmlFor="rfqSelect" className="font-semibold text-slate-800">Select RFQ *</Label>
                     <select
                       id="rfqSelect"
-                      className="flex w-full rounded-md border border-slate-200 bg-white p-2 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-slate-950"
+                      className="flex w-full rounded-md border border-slate-200 bg-white p-2 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
                       value={vendorRfqId}
                       onChange={(e) => setVendorRfqId(e.target.value)}
                       required
                     >
-                      <option value="">-- Choose invited RFQ --</option>
+                      <option value="">-- Choose active RFQ to bid --</option>
                       {eligibleRfqs.map((rfq) => (
                         <option key={rfq.id} value={rfq.id}>
-                          {rfq.title} ({rfq.quantity} {rfq.unit})
+                          {rfq.title}
                         </option>
                       ))}
                     </select>
                   </div>
 
-                  <div className="space-y-2">
-                    <Label htmlFor="price">Unit Price (INR) *</Label>
-                    <Input id="price" type="number" step="0.01" min="0.01" placeholder="45.50" value={unitPrice} onChange={(e) => setUnitPrice(e.target.value)} required />
-                  </div>
+                  {vendorRfqId && (
+                    <>
+                      {/* RFQ Summary Box */}
+                      <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-sm text-slate-700">
+                        <p className="font-semibold text-xs text-slate-400 uppercase tracking-wider mb-1">RFQ Summary</p>
+                        <p className="font-medium text-slate-800">
+                          {quoteLineInputs.map(item => `${item.item} * ${item.qty}`).join(", ")}
+                        </p>
+                      </div>
 
-                  <div className="space-y-2">
-                    <Label htmlFor="delivery">Delivery Timeline (Days) *</Label>
-                    <Input id="delivery" type="number" min="1" placeholder="5" value={deliveryDays} onChange={(e) => setDeliveryDays(e.target.value)} required />
-                  </div>
+                      {/* Items pricing table matching Screen 6 mockup */}
+                      <div className="space-y-3">
+                        <Label className="font-semibold text-slate-800 text-sm">Your Quotation</Label>
+                        <div className="overflow-hidden rounded-xl border border-slate-200">
+                          <table className="w-full text-left border-collapse text-sm">
+                            <thead>
+                              <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                                <th className="p-3">Item</th>
+                                <th className="p-3 w-24">Qty</th>
+                                <th className="p-3 w-40">Unit price</th>
+                                <th className="p-3 w-40">Total</th>
+                                <th className="p-3 w-40">Delivery (days)</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100 text-slate-700">
+                              {quoteLineInputs.map((line, index) => (
+                                <tr key={index}>
+                                  <td className="p-3 font-semibold">{line.item}</td>
+                                  <td className="p-3">{line.qty}</td>
+                                  <td className="p-2">
+                                    <Input
+                                      type="number"
+                                      step="0.01"
+                                      min="0.01"
+                                      placeholder="0.00"
+                                      value={line.unitPrice || ""}
+                                      onChange={(e) => handleLinePriceChange(index, "unitPrice", e.target.value)}
+                                      required
+                                    />
+                                  </td>
+                                  <td className="p-3 font-mono font-bold text-slate-900">
+                                    Rs. {(line.qty * line.unitPrice).toLocaleString()}
+                                  </td>
+                                  <td className="p-2">
+                                    <Input
+                                      type="number"
+                                      min="1"
+                                      value={line.deliveryDays}
+                                      onChange={(e) => handleLinePriceChange(index, "deliveryDays", e.target.value)}
+                                      required
+                                    />
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
 
-                  <div className="space-y-2">
-                    <Label htmlFor="notes">Notes / Scope details</Label>
-                    <textarea 
-                      id="notes" 
-                      rows={3}
-                      className="flex w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950"
-                      placeholder="Pricing includes delivery to main warehouse. Standard 5-ply cartons."
-                      value={notes}
-                      onChange={(e) => setNotes(e.target.value)}
-                    />
-                  </div>
+                      {/* Notes/Terms, Tax Rates and Totals Summary Grid */}
+                      <div className="grid gap-6 md:grid-cols-2 pt-2">
+                        {/* Note / terms & Tax */}
+                        <div className="space-y-4">
+                          <div className="space-y-2">
+                            <Label htmlFor="taxRate">tax / GST %</Label>
+                            <Input
+                              id="taxRate"
+                              type="number"
+                              min="0"
+                              max="100"
+                              value={taxRate}
+                              onChange={(e) => setTaxRate(parseFloat(e.target.value) || 0)}
+                            />
+                          </div>
 
-                  <Button type="submit" disabled={submitting} className="w-full bg-emerald-600 hover:bg-emerald-500 text-white">
-                    {submitting ? <><Loader2 className="mr-2 size-4 animate-spin" /> Submitting...</> : <><Send className="mr-2 size-4" /> Submit Quotation</>}
-                  </Button>
+                          <div className="space-y-2">
+                            <Label htmlFor="paymentTerms">Note / terms</Label>
+                            <textarea
+                              id="paymentTerms"
+                              rows={3}
+                              className="flex w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+                              placeholder="Payment terms..."
+                              value={paymentTerms}
+                              onChange={(e) => setPaymentTerms(e.target.value)}
+                            />
+                          </div>
+                        </div>
+
+                        {/* Totals card */}
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-6 text-sm text-slate-600 space-y-3.5 h-fit">
+                          <div className="flex justify-between font-medium">
+                            <span>Subtotal</span>
+                            <span className="text-slate-900 font-mono">Rs. {calculatedSubtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                          </div>
+                          <div className="flex justify-between font-medium">
+                            <span>GST ({taxRate}%)</span>
+                            <span className="text-slate-900 font-mono">Rs. {calculatedGst.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                          </div>
+                          <div className="border-t border-slate-200 pt-3 flex justify-between font-extrabold text-base text-slate-900">
+                            <span>Grand total</span>
+                            <span className="text-indigo-600 font-mono">Rs. {calculatedGrandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Footer Buttons */}
+                      <div className="flex justify-end gap-2 border-t border-slate-100 pt-5">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={(e) => handleQuotationSubmit(e, "draft")}
+                          disabled={submitting}
+                        >
+                          Save Draft
+                        </Button>
+                        <Button
+                          type="submit"
+                          disabled={submitting}
+                          className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-md shadow-indigo-100"
+                        >
+                          {submitting ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Send className="mr-2 size-4" />}
+                          Submit Quotation
+                        </Button>
+                      </div>
+                    </>
+                  )}
                 </form>
               </CardContent>
             </Card>
 
-            {/* Submitted Bids List */}
-            <div className="md:col-span-2 space-y-4">
+            {/* Submitted bids dashboard logs */}
+            <div className="space-y-4">
               <h3 className="text-lg font-bold text-slate-800">My Submitted Quotations</h3>
               {myQuotations.length > 0 ? (
-                <div className="grid gap-4 sm:grid-cols-2">
+                <div className="grid gap-4 md:grid-cols-2">
                   {myQuotations.map((quote) => {
                     const rfq = rfqsList.find(r => r.id === quote.rfqId);
+                    const details = parseQuotationDetails(quote, rfq);
                     return (
-                      <Card key={quote.id} className="border-slate-200 bg-white">
-                        <CardHeader className="pb-2">
+                      <Card key={quote.id} className="border-slate-200 shadow-sm bg-white hover:shadow-md transition">
+                        <CardHeader className="pb-2 border-b border-slate-50 bg-slate-50/50">
                           <div className="flex justify-between items-start">
-                            <CardTitle className="text-sm font-bold text-slate-800 leading-snug">{rfq?.title || "RFQ details missing"}</CardTitle>
+                            <div>
+                              <CardTitle className="text-sm font-bold text-slate-800 leading-snug">{rfq?.title || "RFQ details missing"}</CardTitle>
+                              <CardDescription className="text-[10px] mt-0.5 font-mono">{quote.id}</CardDescription>
+                            </div>
                             <Badge variant={quote.status === "approved" ? "default" : quote.status === "rejected" ? "destructive" : "secondary"}>
                               {quote.status}
                             </Badge>
                           </div>
                         </CardHeader>
-                        <CardContent className="text-xs text-slate-600 space-y-2">
+                        <CardContent className="text-xs text-slate-600 space-y-2.5 pt-4">
                           <div className="flex justify-between border-b border-slate-50 pb-1">
-                            <span>Unit Price:</span>
-                            <span className="font-semibold text-slate-950">Rs. {parseFloat(quote.unitPrice).toFixed(2)}</span>
+                            <span>Subtotal:</span>
+                            <span className="font-semibold text-slate-800">Rs. {details.subtotal.toLocaleString()}</span>
                           </div>
                           <div className="flex justify-between border-b border-slate-50 pb-1">
-                            <span>Total (Est):</span>
-                            <span className="font-semibold text-slate-900">
-                              Rs. {((rfq?.quantity || 0) * parseFloat(quote.unitPrice)).toLocaleString()}
-                            </span>
+                            <span>GST (18%):</span>
+                            <span className="font-semibold text-slate-800">Rs. {details.gst.toLocaleString()}</span>
+                          </div>
+                          <div className="flex justify-between border-b border-slate-50 pb-1 font-bold text-slate-900">
+                            <span>Grand Total:</span>
+                            <span className="text-indigo-600">Rs. {details.grandTotal.toLocaleString()}</span>
                           </div>
                           <div className="flex justify-between border-b border-slate-50 pb-1">
-                            <span>Delivery Logistics:</span>
-                            <span className="font-semibold text-slate-900">{quote.deliveryDays} Days</span>
+                            <span>Max Delivery Timeline:</span>
+                            <span className="font-semibold text-slate-800">{details.deliveryDays} Days</span>
                           </div>
-                          {quote.notes && (
-                            <p className="mt-2 text-slate-500 italic">“{quote.notes}”</p>
+                          {details.paymentTerms && (
+                            <p className="mt-2 text-slate-500 italic text-[11px] bg-slate-50 p-2 rounded border border-slate-100">
+                              “{details.paymentTerms}”
+                            </p>
                           )}
                         </CardContent>
                       </Card>
@@ -327,47 +537,50 @@ export default function QuotationsPage() {
                 </div>
               ) : (
                 <div className="text-center p-12 bg-white rounded-xl border border-slate-100">
-                  <Clock className="size-10 mx-auto text-slate-300" />
-                  <p className="mt-2 text-sm text-slate-500">You haven't submitted any quotations yet.</p>
+                  <Clock className="size-10 mx-auto text-slate-300 mb-2" />
+                  <p className="text-sm text-slate-500">You haven't submitted any quotations yet.</p>
                 </div>
               )}
             </div>
-
           </div>
         )}
       </div>
     );
   }
 
-  // --- OFFICER / MANAGER / ADMIN WORKSPACE (Comparison Screen) ---
+  // --- OFFICER / MANAGER / ADMIN WORKSPACE (Screen 7 Comparison Screen) ---
   const activeRfqsForCompare = rfqsList.filter(r => !["draft", "closed"].includes(r.status));
   const comparedQuotes = quotationsList.filter(q => q.rfqId === selectedRfqId);
+  const selectedRfq = rfqsList.find(r => r.id === selectedRfqId);
   
-  // Calculate lowest price in comparison group
-  const prices = comparedQuotes.map(q => parseFloat(q.unitPrice));
-  const lowestPriceVal = prices.length > 0 ? Math.min(...prices) : 0;
+  // Calculate details for each quote, identify lowest grand total
+  const quotesWithDetails = comparedQuotes.map(q => {
+    const details = parseQuotationDetails(q, selectedRfq);
+    return {
+      quote: q,
+      details,
+    };
+  });
 
-  const getRfqHeading = () => {
-    const matched = rfqsList.find(r => r.id === selectedRfqId);
-    return matched ? `${matched.title} (Quantity: ${matched.quantity} ${matched.unit})` : "Select RFQ to Compare";
-  };
+  const lowestGrandTotal = quotesWithDetails.length > 0
+    ? Math.min(...quotesWithDetails.map(q => q.details.grandTotal))
+    : 0;
 
   return (
     <div className="p-6 space-y-6">
-      
       <div>
-        <h1 className="text-3xl font-bold tracking-tight text-slate-900">Quotation Comparison</h1>
-        <p className="text-slate-500 text-sm">Perform side-by-side analysis of bids, identify lowest unit cost, and route to approval.</p>
+        <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Quotation Comparison</h1>
+        <p className="text-slate-500 text-sm mt-1">Compare prices, delivery logs, ratings. Selecting initiates approvals workflow.</p>
       </div>
 
-      {/* Select RFQ dropdown bar */}
-      <Card className="bg-white border-slate-100">
+      {/* Select RFQ bar */}
+      <Card className="bg-white border-slate-200/80 shadow-sm">
         <CardContent className="py-4 flex flex-col gap-4 sm:flex-row sm:items-center justify-between">
-          <div className="flex-1 max-w-md space-y-1">
-            <Label htmlFor="compareRfqSelect">Active RFQ Group</Label>
+          <div className="flex-1 max-w-md space-y-1.5">
+            <Label htmlFor="compareRfqSelect" className="font-semibold text-slate-800">Active RFQ Group</Label>
             <select
               id="compareRfqSelect"
-              className="flex w-full rounded-md border border-slate-200 bg-white p-2 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-slate-950"
+              className="flex w-full rounded-md border border-slate-200 bg-white p-2.5 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
               value={selectedRfqId}
               onChange={(e) => setSelectedRfqId(e.target.value)}
             >
@@ -380,8 +593,8 @@ export default function QuotationsPage() {
             </select>
           </div>
           {selectedRfqId && (
-            <Badge variant="outline" className="h-fit py-1.5 px-3 bg-slate-50 border-slate-200 text-slate-700 font-medium">
-              Bids Submitted: {comparedQuotes.length}
+            <Badge variant="secondary" className="h-fit py-1.5 px-3 bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold">
+              Quotations Received: {comparedQuotes.length}
             </Badge>
           )}
         </CardContent>
@@ -389,103 +602,188 @@ export default function QuotationsPage() {
 
       {selectedRfqId ? (
         <div className="space-y-4">
-          <h3 className="text-lg font-bold text-slate-800">{getRfqHeading()}</h3>
+          <div className="flex flex-col">
+            <h3 className="text-xl font-bold text-slate-900">Quotation Comparison</h3>
+            <p className="text-xs text-slate-500 mt-0.5">RFQ: {selectedRfq?.title} — {comparedQuotes.length} quotations received</p>
+          </div>
           
-          {comparedQuotes.length > 0 ? (
-            <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-              {comparedQuotes.map((quote) => {
-                const vendor = vendorsList.find(v => v.id === quote.vendorId);
-                const isLowest = parseFloat(quote.unitPrice) === lowestPriceVal;
+          {quotesWithDetails.length > 0 ? (
+            <div className="space-y-6">
+              {/* Matrix Layout matching Screen 7 exactly */}
+              <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50/70 text-slate-800">
+                        <th className="p-4 font-bold text-slate-900 w-48 border-r border-slate-100">Criteria</th>
+                        {quotesWithDetails.map((qd) => {
+                          const vendor = vendorsList.find(v => v.id === qd.quote.vendorId);
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          return (
+                            <th
+                              key={qd.quote.id}
+                              className={`p-4 font-bold border-r border-slate-100 text-center transition ${
+                                isLowest ? "bg-emerald-50 text-emerald-800" : "text-slate-800"
+                              }`}
+                            >
+                              {vendor?.name} {isLowest && <span className="text-[10px] bg-emerald-600 text-white font-semibold px-1.5 py-0.5 rounded-full ml-1 select-none">Lowest</span>}
+                            </th>
+                          );
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-slate-700">
+                      {/* Grand Total */}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="p-4 font-bold border-r border-slate-100">Grand Total</td>
+                        {quotesWithDetails.map((qd) => {
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          return (
+                            <td
+                              key={qd.quote.id}
+                              className={`p-4 text-center font-mono font-extrabold text-sm border-r border-slate-100 ${
+                                isLowest ? "bg-emerald-50/50 text-emerald-700" : "text-slate-900"
+                              }`}
+                            >
+                              Rs. {qd.details.grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </td>
+                          );
+                        })}
+                      </tr>
 
-                return (
-                  <Card 
-                    key={quote.id} 
-                    className={`transition duration-200 flex flex-col justify-between ${
-                      isLowest 
-                        ? "border-emerald-400 bg-emerald-50/50 shadow-md shadow-emerald-500/5 ring-1 ring-emerald-400" 
-                        : "border-slate-200 bg-white"
-                    }`}
-                  >
-                    <CardHeader className="pb-3">
-                      <div className="flex justify-between items-start gap-2">
-                        <div>
-                          <CardTitle className="text-base font-bold text-slate-900 leading-snug">
-                            {vendor?.name || "Unknown Supplier"}
-                          </CardTitle>
-                          <CardDescription className="text-xs">GST: {vendor?.gstNumber}</CardDescription>
-                        </div>
-                        {isLowest ? (
-                          <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">Lowest Price</Badge>
-                        ) : (
-                          <Badge variant="secondary" className="capitalize">{quote.status}</Badge>
-                        )}
-                      </div>
-                    </CardHeader>
-                    
-                    <CardContent className="space-y-3 py-2 text-sm text-slate-600 border-t border-slate-100/60 pt-3">
-                      <div className="flex justify-between items-baseline">
-                        <span>Unit Bid Price:</span>
-                        <span className="text-xl font-extrabold text-slate-900">
-                          Rs. {parseFloat(quote.unitPrice).toFixed(2)}
-                        </span>
-                      </div>
+                      {/* GST % */}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="p-4 font-semibold border-r border-slate-100 text-slate-500">GST %</td>
+                        {quotesWithDetails.map((qd) => {
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          return (
+                            <td
+                              key={qd.quote.id}
+                              className={`p-4 text-center border-r border-slate-100 ${
+                                isLowest ? "bg-emerald-50/30" : ""
+                              }`}
+                            >
+                              18%
+                            </td>
+                          );
+                        })}
+                      </tr>
 
-                      <div className="flex justify-between">
-                        <span>Delivery Speed:</span>
-                        <span className="font-semibold text-slate-900">{quote.deliveryDays} Days</span>
-                      </div>
+                      {/* Delivery (days) */}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="p-4 font-semibold border-r border-slate-100 text-slate-500">Delivery (days)</td>
+                        {quotesWithDetails.map((qd) => {
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          return (
+                            <td
+                              key={qd.quote.id}
+                              className={`p-4 text-center font-medium border-r border-slate-100 ${
+                                isLowest ? "bg-emerald-50/30" : ""
+                              }`}
+                            >
+                              {qd.details.deliveryDays} days
+                            </td>
+                          );
+                        })}
+                      </tr>
 
-                      <div className="flex justify-between items-center">
-                        <span>Vendor Audit Rating:</span>
-                        <span className="flex items-center gap-1 font-semibold text-slate-900">
-                          <Star className="size-3.5 fill-amber-400 text-amber-400" />
-                          {vendor?.rating || "4.00"}
-                        </span>
-                      </div>
+                      {/* Vendor rating */}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="p-4 font-semibold border-r border-slate-100 text-slate-500">Vendor rating</td>
+                        {quotesWithDetails.map((qd) => {
+                          const vendor = vendorsList.find(v => v.id === qd.quote.vendorId);
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          return (
+                            <td
+                              key={qd.quote.id}
+                              className={`p-4 text-center font-medium border-r border-slate-100 ${
+                                isLowest ? "bg-emerald-50/30" : ""
+                              }`}
+                            >
+                              <span className="inline-flex items-center gap-1">
+                                <Star className="size-3.5 fill-amber-400 text-amber-400" />
+                                {vendor?.rating || "4.0"}/5
+                              </span>
+                            </td>
+                          );
+                        })}
+                      </tr>
 
-                      {quote.notes && (
-                        <div className="mt-3 rounded bg-white/60 p-2.5 text-xs border border-slate-100 italic text-slate-500">
-                          “{quote.notes}”
-                        </div>
-                      )}
-                    </CardContent>
+                      {/* Payment terms */}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="p-4 font-semibold border-r border-slate-100 text-slate-500">Payment terms</td>
+                        {quotesWithDetails.map((qd) => {
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          return (
+                            <td
+                              key={qd.quote.id}
+                              className={`p-4 text-center text-xs italic text-slate-500 border-r border-slate-100 max-w-xs ${
+                                isLowest ? "bg-emerald-50/30" : ""
+                              }`}
+                            >
+                              {qd.details.paymentTerms}
+                            </td>
+                          );
+                        })}
+                      </tr>
 
-                    <CardFooter className="border-t border-slate-100/60 pt-3 bg-slate-50/40">
-                      {quote.status === "submitted" ? (
-                        <Button 
-                          onClick={() => handleShortlistForApproval(quote.id)}
-                          disabled={actioningQuoteId === quote.id}
-                          className="w-full bg-slate-900 text-white hover:bg-slate-800 text-xs font-semibold"
-                        >
-                          {actioningQuoteId === quote.id ? (
-                            <><Loader2 className="mr-2 size-3 animate-spin" /> Submitting...</>
-                          ) : (
-                            <><FileCheck className="mr-1.5 size-3.5" /> Submit to Manager Approval</>
-                          )}
-                        </Button>
-                      ) : (
-                        <div className="w-full flex items-center justify-center gap-1.5 text-xs font-bold text-slate-500 py-1.5">
-                          <Check className="size-4 text-emerald-600" /> Shortlisted for Review
-                        </div>
-                      )}
-                    </CardFooter>
-                  </Card>
-                );
-              })}
+                      {/* Selection Actions row */}
+                      <tr className="bg-slate-50/50">
+                        <td className="p-4 font-bold border-r border-slate-100">Actions</td>
+                        {quotesWithDetails.map((qd) => {
+                          const isLowest = qd.details.grandTotal === lowestGrandTotal;
+                          const showButton = qd.quote.status === "submitted";
+                          return (
+                            <td
+                              key={qd.quote.id}
+                              className={`p-4 text-center border-r border-slate-100 ${
+                                isLowest ? "bg-emerald-50/40" : ""
+                              }`}
+                            >
+                              {showButton ? (
+                                <Button
+                                  size="sm"
+                                  onClick={() => handleShortlistForApproval(qd.quote.id)}
+                                  disabled={actioningQuoteId === qd.quote.id}
+                                  className={
+                                    isLowest
+                                      ? "bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs shadow-sm"
+                                      : "bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold"
+                                  }
+                                >
+                                  {actioningQuoteId === qd.quote.id ? (
+                                    <Loader2 className="size-3 animate-spin" />
+                                  ) : (
+                                    isLowest ? "Select & Approve" : "Select"
+                                  )}
+                                </Button>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 text-xs font-bold text-indigo-600">
+                                  <Check className="size-3.5" /> Routed to Approvals
+                                </span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <p className="text-xs text-rose-500 font-medium">* Green = lowest price, selecting vendor initiates the approval workflow.</p>
             </div>
           ) : (
             <div className="text-center p-12 bg-white rounded-xl border border-slate-100">
-              <ArrowUpDown className="size-12 mx-auto text-slate-300" />
-              <h3 className="mt-4 text-lg font-semibold text-slate-800">No Bids Submitted</h3>
-              <p className="text-slate-500 text-sm mt-1">Vendors have not submitted bid responses for this RFQ yet.</p>
+              <ArrowUpDown className="size-12 mx-auto text-slate-300 mb-2" />
+              <p className="text-sm text-slate-500">No quotation bids submitted yet for this RFQ.</p>
             </div>
           )}
         </div>
       ) : (
         <div className="text-center p-12 bg-white rounded-xl border border-slate-100">
-          <Building2 className="size-12 mx-auto text-slate-300" />
+          <Building2 className="size-12 mx-auto text-slate-300 mb-2" />
           <h3 className="mt-4 text-lg font-semibold text-slate-800">No RFQ Selected</h3>
-          <p className="text-slate-500 text-sm mt-1">Select an active Request for Quotation above to compare supplier bid documents.</p>
+          <p className="text-slate-500 text-sm mt-1">Select an active Request for Quotation above to compare vendor bid details.</p>
         </div>
       )}
     </div>

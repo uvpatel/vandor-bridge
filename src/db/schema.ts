@@ -258,3 +258,13 @@ export const quotationsRelations = relations(quotations, ({ one, many }) => ({
   approvals: many(approvals),
   purchaseOrders: many(purchaseOrders),
 }));
+
+// ─── Better Auth singular-name aliases ───────────────────────────────
+// The drizzle adapter resolves models by singular table name
+// (e.g. schema["verification"]), so we re-export with those keys.
+export {
+  users as user,
+  sessions as session,
+  accounts as account,
+  verifications as verification,
+};
